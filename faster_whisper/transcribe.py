@@ -2,11 +2,14 @@ import itertools
 import json
 import logging
 import os
+import uuid
 import zlib
+from dataclasses import dataclass
 
 from inspect import signature
-from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union, cast
 
+from anyio import from_thread
 import ctranslate2
 import numpy as np
 import tokenizers
@@ -21,6 +24,9 @@ from faster_whisper.vad import (
     collect_chunks,
     get_speech_timestamps,
 )
+
+from vllm.inputs.data import PromptType
+from vllm import SamplingParams
 
 
 class Word(NamedTuple):
@@ -80,6 +86,13 @@ class TranscriptionInfo(NamedTuple):
     all_language_probs: Optional[List[Tuple[str, float]]]
     transcription_options: TranscriptionOptions
     vad_options: VadOptions
+
+
+@dataclass
+class WhisperGenerationResult:
+    sequences_ids: list[list[int]]
+    scores: list[float]
+    no_speech_prob: float
 
 
 class WhisperModel:
@@ -142,6 +155,8 @@ class WhisperModel:
                 cache_dir=download_root,
             )
 
+        self.engine_client = None
+
         self.model = ctranslate2.models.Whisper(
             model_path,
             device=device,
@@ -174,6 +189,7 @@ class WhisperModel:
         self.input_stride = 2
         self.time_precision = 0.02
         self.max_length = 448
+        self.no_speech_id = self.hf_tokenizer.token_to_id("<|nocaptions|>")
 
     @property
     def supported_languages(self) -> List[str]:
@@ -474,7 +490,7 @@ class WhisperModel:
             hotwords=hotwords,
         )
 
-        segments = self.generate_segments(features, tokenizer, options, encoder_output)
+        segments = self.generate_segments(audio, features, tokenizer, options, encoder_output)
 
         if speech_chunks:
             segments = restore_speech_timestamps(segments, speech_chunks, sampling_rate)
@@ -493,6 +509,7 @@ class WhisperModel:
 
     def generate_segments(
         self,
+        audio: np.ndarray,
         features: np.ndarray,
         tokenizer: Tokenizer,
         options: TranscriptionOptions,
@@ -569,6 +586,9 @@ class WhisperModel:
             segment_duration = segment_size * self.feature_extractor.time_per_frame
             segment = pad_or_trim(segment, self.feature_extractor.nb_max_frames)
 
+            multiplier = int(self.feature_extractor.sampling_rate * self.feature_extractor.time_per_frame)
+            audio_segment = audio[seek * multiplier : (seek + segment_size) * multiplier]
+
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(
                     "Processing segment at %s", format_timestamp(time_offset)
@@ -591,7 +611,7 @@ class WhisperModel:
                 avg_logprob,
                 temperature,
                 compression_ratio,
-            ) = self.generate_with_fallback(encoder_output, prompt, tokenizer, options)
+            ) = self.generate_with_fallback(audio_segment, encoder_output, prompt, tokenizer, options)
 
             if options.no_speech_threshold is not None:
                 # no voice activity check
@@ -839,6 +859,7 @@ class WhisperModel:
 
     def generate_with_fallback(
         self,
+        audio_segment: np.ndarray,
         encoder_output: ctranslate2.StorageView,
         prompt: List[int],
         tokenizer: Tokenizer,
@@ -881,13 +902,50 @@ class WhisperModel:
                     "patience": options.patience,
                 }
 
-            result = self.model.generate(
+            vllm_prompt = {
+                "encoder_prompt": {
+                    "prompt": "",
+                    "multi_modal_data": {
+                        "audio": (audio_segment, self.feature_extractor.sampling_rate),
+                    },
+                },
+                "decoder_prompt": {
+                    "prompt_token_ids": prompt,
+                }
+            }
+
+            vllm_prompt = cast(PromptType, vllm_prompt)
+
+            sampling_params = SamplingParams(
+                n=5,
+                repetition_penalty=options.repetition_penalty,
+                max_tokens=max_length - len(prompt),
+                logprobs=1,
+                prompt_logprobs=1,
+            )
+
+            async def run_engine_client():
+                result_generator = self.engine_client.generate(
+                    vllm_prompt,
+                    sampling_params,
+                    request_id=str(uuid.uuid4()),
+                )
+                async for op in result_generator:
+                    _result = op
+                return _result
+
+            result = from_thread.run(run_engine_client)
+
+            sequences_ids = [list(output.token_ids) for output in result.outputs]
+            scores = [output.cumulative_logprob / len(output.token_ids) for output in result.outputs]
+
+            result_ct2 = self.model.generate(
                 encoder_output,
                 [prompt],
                 length_penalty=options.length_penalty,
                 repetition_penalty=options.repetition_penalty,
                 no_repeat_ngram_size=options.no_repeat_ngram_size,
-                max_length=max_length,
+                max_length=1,
                 return_scores=True,
                 return_no_speech_prob=True,
                 suppress_blank=options.suppress_blank,
@@ -895,6 +953,12 @@ class WhisperModel:
                 max_initial_timestamp_index=max_initial_timestamp_index,
                 **kwargs,
             )[0]
+
+            result = WhisperGenerationResult(
+                sequences_ids=sequences_ids,
+                scores=scores,
+                no_speech_prob=result_ct2.no_speech_prob,
+            )
 
             tokens = result.sequences_ids[0]
 
