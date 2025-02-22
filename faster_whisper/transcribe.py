@@ -910,7 +910,7 @@ class WhisperModel:
                     },
                 },
                 "decoder_prompt": {
-                    "prompt_token_ids": prompt,
+                    "prompt_token_ids": prompt + [tokenizer.timestamp_begin],
                 }
             }
 
@@ -918,10 +918,9 @@ class WhisperModel:
 
             sampling_params = SamplingParams(
                 n=5,
-                repetition_penalty=options.repetition_penalty,
                 max_tokens=max_length - len(prompt),
                 logprobs=1,
-                prompt_logprobs=1,
+                top_k=5,
             )
 
             async def run_engine_client():
@@ -934,9 +933,16 @@ class WhisperModel:
                     _result = op
                 return _result
 
+            def modify_token_ids(token_ids):
+                if token_ids[0] != tokenizer.timestamp_begin:
+                    token_ids = [tokenizer.timestamp_begin] + token_ids
+                if token_ids[-1] == tokenizer.eot:
+                    token_ids.pop()
+                return token_ids
+
             result = from_thread.run(run_engine_client)
 
-            sequences_ids = [list(output.token_ids) for output in result.outputs]
+            sequences_ids = [modify_token_ids(list(output.token_ids)) for output in result.outputs]
             scores = [output.cumulative_logprob / len(output.token_ids) for output in result.outputs]
 
             result_ct2 = self.model.generate(
