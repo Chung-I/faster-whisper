@@ -918,7 +918,7 @@ class WhisperModel:
 
             sampling_params = SamplingParams(
                 n=5,
-                max_tokens=max_length - len(prompt),
+                max_tokens=max_length - len(prompt) - 2,
                 logprobs=1,
                 top_k=5,
             )
