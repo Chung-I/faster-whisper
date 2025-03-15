@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from inspect import signature
 from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union, cast
 
-from anyio import from_thread
+from starlette.concurrency import run_in_threadpool
+import anyio
 import ctranslate2
 import numpy as np
 import tokenizers
@@ -26,7 +27,7 @@ from faster_whisper.vad import (
 )
 
 from vllm.inputs.data import PromptType
-from vllm import SamplingParams
+from vllm.sampling_params import BeamSearchParams, SamplingParams
 
 
 class Word(NamedTuple):
@@ -93,6 +94,30 @@ class WhisperGenerationResult:
     sequences_ids: list[list[int]]
     scores: list[float]
     no_speech_prob: float
+
+
+async def vllm_generate(
+        client,
+        request_id: str,
+        prompt: PromptType,
+        sampling_params: SamplingParams):
+
+    final_output = None
+    count = 0
+    async for out in client.generate(
+            request_id=request_id,
+            prompt=prompt,
+            sampling_params=sampling_params):
+    # async for out in client.beam_search(
+    #         prompt=prompt,
+    #         request_id=request_id,
+    #         params=sampling_params):
+
+        count += 1
+        final_output = out
+        await anyio.sleep(0.)
+
+    return final_output
 
 
 class WhisperModel:
@@ -214,7 +239,7 @@ class WhisperModel:
 
         return config
 
-    def transcribe(
+    async def transcribe(
         self,
         audio: Union[str, BinaryIO, np.ndarray],
         language: Optional[str] = None,
@@ -410,10 +435,13 @@ class WhisperModel:
                     segment = features[
                         :, seek : seek + self.feature_extractor.nb_max_frames
                     ]
-                    encoder_output = self.encode(segment)
+                    encoder_output = await self.encode(segment)
                     # results is a list of tuple[str, float] with language names and
                     # probabilities.
-                    results = self.model.detect_language(encoder_output)[0]
+                    results = (await run_in_threadpool(
+                        self.model.detect_language,
+                        encoder_output,
+                    ))[0]
                     # Parse language names to strip out markers
                     all_language_probs = [
                         (token[2:-2], prob) for (token, prob) in results
@@ -507,7 +535,7 @@ class WhisperModel:
 
         return segments, info
 
-    def generate_segments(
+    async def generate_segments(
         self,
         audio: np.ndarray,
         features: np.ndarray,
@@ -604,14 +632,14 @@ class WhisperModel:
             )
 
             if seek > 0 or encoder_output is None:
-                encoder_output = self.encode(segment)
+                encoder_output = await self.encode(segment)
 
             (
                 result,
                 avg_logprob,
                 temperature,
                 compression_ratio,
-            ) = self.generate_with_fallback(audio_segment, encoder_output, prompt, tokenizer, options)
+            ) = await self.generate_with_fallback(audio_segment, encoder_output, prompt, tokenizer, options)
 
             if options.no_speech_threshold is not None:
                 # no voice activity check
@@ -847,7 +875,7 @@ class WhisperModel:
 
                 prompt_reset_since = len(all_tokens)
 
-    def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
+    async def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
         # When the model is running on multiple GPUs, the encoder output should be moved
         # to the CPU since we don't know which GPU will handle the next job.
         to_cpu = self.model.device == "cuda" and len(self.model.device_index) > 1
@@ -855,9 +883,13 @@ class WhisperModel:
         features = np.expand_dims(features, 0)
         features = get_ctranslate2_storage(features)
 
-        return self.model.encode(features, to_cpu=to_cpu)
+        return await run_in_threadpool(
+            self.model.encode,
+            features,
+            to_cpu,
+        )
 
-    def generate_with_fallback(
+    async def generate_with_fallback(
         self,
         audio_segment: np.ndarray,
         encoder_output: ctranslate2.StorageView,
@@ -903,15 +935,10 @@ class WhisperModel:
                 }
 
             vllm_prompt = {
-                "encoder_prompt": {
-                    "prompt": "",
-                    "multi_modal_data": {
-                        "audio": (audio_segment, self.feature_extractor.sampling_rate),
-                    },
+                "prompt_token_ids": prompt + [tokenizer.timestamp_begin],
+                "multi_modal_data": {
+                    "audio": (audio_segment, self.feature_extractor.sampling_rate),
                 },
-                "decoder_prompt": {
-                    "prompt_token_ids": prompt + [tokenizer.timestamp_begin],
-                }
             }
 
             vllm_prompt = cast(PromptType, vllm_prompt)
@@ -922,16 +949,32 @@ class WhisperModel:
                 logprobs=1,
                 top_k=5,
             )
+            # sampling_params = BeamSearchParams(
+            #     beam_width=5,
+            #     max_tokens=max_length - len(prompt) - 2,
+            #     logprobs=1,
+            #     ignore_eos=False,
+            #     temperature=1.0,
+            #     length_penalty=options.length_penalty,
+            #     include_stop_str_in_output=False,
+            # )
 
-            async def run_engine_client():
-                result_generator = self.engine_client.generate(
-                    vllm_prompt,
-                    sampling_params,
-                    request_id=str(uuid.uuid4()),
-                )
-                async for op in result_generator:
-                    _result = op
-                return _result
+            this_uuid = str(uuid.uuid4())
+            print(f"generating {this_uuid}")
+            result = await vllm_generate(
+                self.engine_client,
+                this_uuid,
+                vllm_prompt,
+                sampling_params,
+            )
+
+            # result = anyio.from_thread.run(
+            #     vllm_generate,
+            #     self.engine_client,
+            #     str(uuid.uuid4()),
+            #     vllm_prompt,
+            #     sampling_params,
+            # )
 
             def modify_token_ids(token_ids):
                 if token_ids[0] != tokenizer.timestamp_begin:
@@ -940,12 +983,11 @@ class WhisperModel:
                     token_ids.pop()
                 return token_ids
 
-            result = from_thread.run(run_engine_client)
-
             sequences_ids = [modify_token_ids(list(output.token_ids)) for output in result.outputs]
             scores = [output.cumulative_logprob / len(output.token_ids) for output in result.outputs]
 
-            result_ct2 = self.model.generate(
+            result_ct2 = (await run_in_threadpool(
+                self.model.generate,
                 encoder_output,
                 [prompt],
                 length_penalty=options.length_penalty,
@@ -958,7 +1000,7 @@ class WhisperModel:
                 suppress_tokens=options.suppress_tokens,
                 max_initial_timestamp_index=max_initial_timestamp_index,
                 **kwargs,
-            )[0]
+            ))[0]
 
             result = WhisperGenerationResult(
                 sequences_ids=sequences_ids,
